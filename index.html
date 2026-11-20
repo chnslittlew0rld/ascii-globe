@@ -1,0 +1,1752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>DIVIZTY — ASCII Rotating Globe</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #666e7d;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  // --- Deterministic Seeded PRNG ---
+  function mulberry32(a) {
+    return function() {
+      let t = a += 0x6D2B79F5;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const rng = mulberry32(20261120);
+
+  // --- Math Helpers ---
+  const clamp = (v, lo, hi) => v < lo ? lo : (v > hi ? hi : v);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smoothstep = (e0, e1, x) => {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  const easeInOutPow = (t, p = 1.5) => {
+    t = clamp(t, 0, 1);
+    return t < 0.5 ? 0.5 * Math.pow(2 * t, p) : 1 - 0.5 * Math.pow(2 * (1 - t), p);
+  };
+  const easeOutBack = (t, s = 1.70158) => {
+    t = clamp(t, 0, 1);
+    const c3 = s + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2);
+  };
+
+  // --- 5x7 Block Font (for PLAY & DIVIZTY) ---
+  const FONT_5X7 = {
+    'P': ['11110','10001','10001','11110','10000','10000','10000'],
+    'L': ['10000','10000','10000','10000','10000','10000','11111'],
+    'A': ['01110','10001','10001','11111','10001','10001','10001'],
+    'Y': ['10001','10001','01010','00100','00100','00100','00100'],
+    'D': ['11110','10001','10001','10001','10001','10001','11110'],
+    'I': ['11111','00100','00100','00100','00100','00100','11111'],
+    'V': ['10001','10001','10001','10001','10001','01010','00100'],
+    'Z': ['11111','00001','00010','00100','01000','10000','11111'],
+    'T': ['11111','00100','00100','00100','00100','00100','00100']
+  };
+
+  // --- Canvas & Grid State ---
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const offCanvas = document.createElement('canvas');
+  const offCtx = offCanvas.getContext('2d');
+
+  let W = 0, H = 0, DPR = 1;
+  let PW = 0, CW = 0, CH = 0, AR = 1 / 1.62;
+  let cols = 0, rows = 0, stageLeftCol = 0, cx = 0;
+  let floorRow = 0, globeCenterRow = 0, globeRadiusCols = 0, apexRow = 0;
+  let fontStr = '';
+
+  let gridChar = null;
+  let gridCol = null;
+  let gridZ = null;
+  let haloSeed = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    offCanvas.width = canvas.width;
+    offCanvas.height = canvas.height;
+
+    PW = Math.min(W, H * (9 / 16));
+    CW = PW / 124;
+    CH = CW * 1.62;
+    AR = CW / CH;
+
+    cols = Math.ceil(W / CW) + 2;
+    rows = Math.floor(H / CH);
+    const stageLeftPx = (W - PW) * 0.5;
+    stageLeftCol = stageLeftPx / CW;
+    cx = stageLeftCol + 62;
+
+    floorRow = rows * 0.845;
+    globeRadiusCols = 0.31 * 124;
+    // Globe sits cleanly above the pedestal, leaving top quarter open
+    globeCenterRow = rows * 0.485;
+    apexRow = globeCenterRow - globeRadiusCols * AR - 3;
+
+    const fontSize = Math.max(6, 0.95 * CH);
+    fontStr = `bold ${fontSize.toFixed(2)}px Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+
+    const size = cols * rows;
+    gridChar = new Array(size).fill('');
+    gridCol = new Array(size).fill('');
+    gridZ = new Float32Array(size).fill(-1e9);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function clearGrid() {
+    gridChar.fill('');
+    gridCol.fill('');
+    gridZ.fill(-1e9);
+  }
+
+  function put(x, y, ch, col, z) {
+    const ix = Math.round(x);
+    const iy = Math.round(y);
+    if (ix < 0 || ix >= cols || iy < 0 || iy >= rows) return;
+    const idx = iy * cols + ix;
+    if (z >= gridZ[idx]) {
+      gridZ[idx] = z;
+      gridChar[idx] = ch;
+      gridCol[idx] = col;
+    }
+  }
+
+  function putHalo(x, y, radiusCols, strength, hue, sat, light) {
+    const ix0 = Math.round(x);
+    const iy0 = Math.round(y);
+    const rx = Math.ceil(radiusCols);
+    const ry = Math.ceil(radiusCols * AR);
+    for (let dy = -ry; dy <= ry; dy++) {
+      const iy = iy0 + dy;
+      if (iy < 0 || iy >= rows) continue;
+      for (let dx = -rx; dx <= rx; dx++) {
+        const ix = ix0 + dx;
+        if (ix < 0 || ix >= cols) continue;
+        const idx = iy * cols + ix;
+        if (gridChar[idx] !== '') continue; // Never overwrite occupied cells
+        const dist = Math.hypot(dx, dy / AR);
+        if (dist < 0.7 || dist > radiusCols) continue;
+        const norm = dist / radiusCols;
+        const prob = strength * Math.pow(1 - norm, 1.85);
+        // Deterministic spatial + 9Hz time hash
+        let h = ((ix * 374761393) ^ (iy * 668265263) ^ (haloSeed * 1442695041)) >>> 0;
+        h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+        const r = ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+        if (r < prob) {
+          const ch = norm < 0.36 ? '+' : (norm < 0.68 ? ':' : '.');
+          const l = clamp(light * (1 - norm * 0.35), 25, 96);
+          gridChar[idx] = ch;
+          gridCol[idx] = `hsl(${hue}, ${sat}%, ${l.toFixed(0)}%)`;
+          gridZ[idx] = -9999;
+        }
+      }
+    }
+  }
+
+  // --- Procedural World Map (Continents + Polar Caps + DIVIZTY Equatorial/Banner Relief) ---
+  const continentBlobs = [
+    // Americas
+    { lon: -1.75, lat: 0.68, rx: 0.52, ry: 0.34, w: 1.0 },
+    { lon: -1.45, lat: 0.42, rx: 0.36, ry: 0.25, w: 0.9 },
+    { lon: -1.10, lat: -0.22, rx: 0.34, ry: 0.45, w: 1.0 },
+    { lon: -1.18, lat: -0.58, rx: 0.20, ry: 0.32, w: 0.85 },
+    // Europe & Africa
+    { lon: 0.22, lat: 0.82, rx: 0.42, ry: 0.24, w: 0.95 },
+    { lon: 0.35, lat: 0.12, rx: 0.44, ry: 0.42, w: 1.05 },
+    { lon: 0.42, lat: -0.35, rx: 0.28, ry: 0.38, w: 0.95 },
+    // Asia
+    { lon: 1.25, lat: 0.78, rx: 0.68, ry: 0.34, w: 1.05 },
+    { lon: 1.55, lat: 0.42, rx: 0.55, ry: 0.32, w: 1.0 },
+    { lon: 1.85, lat: 0.18, rx: 0.32, ry: 0.24, w: 0.85 },
+    // Australia
+    { lon: 2.32, lat: -0.46, rx: 0.30, ry: 0.22, w: 0.95 }
+  ];
+
+  function wrapLon(a) {
+    a = (a + Math.PI) % (Math.PI * 2);
+    if (a < 0) a += Math.PI * 2;
+    return a - Math.PI;
+  }
+
+  // Pre-build DIVIZTY bitmap for wrapping onto the globe & orbiting ribbon
+  const BRAND = 'DIVIZTY';
+  const brandCols = BRAND.length * 6 - 1; // 41 cols
+  const brandRows = 7;
+  const brandBitmap = new Uint8Array(brandCols * brandRows);
+  for (let c = 0; c < BRAND.length; c++) {
+    const glyph = FONT_5X7[BRAND[c]];
+    for (let r = 0; r < 7; r++) {
+      for (let x = 0; x < 5; x++) {
+        if (glyph[r][x] === '1') {
+          brandBitmap[r * brandCols + c * 6 + x] = 1;
+        }
+      }
+    }
+  }
+
+  function sampleBrand(lon, lat) {
+    // Wrap DIVIZTY twice around the globe at latitude band [-0.24, 0.24]
+    if (Math.abs(lat) > 0.24) return 0;
+    const v = 1 - (lat + 0.24) / 0.48; // 0 top .. 1 bottom
+    const r = Math.min(brandRows - 1, Math.max(0, Math.floor(v * brandRows)));
+    // Two repetitions around 2*PI with subtle spacing
+    let u = ((lon + Math.PI) / Math.PI) % 1; // 0..1 twice around
+    if (u < 0) u += 1;
+    // Leave 18% gap between the two repetitions
+    if (u > 0.82) return 0;
+    const c = Math.floor((u / 0.82) * brandCols);
+    if (c < 0 || c >= brandCols) return 0;
+    return brandBitmap[r * brandCols + c];
+  }
+
+  function sampleElevation(lon, lat) {
+    let h = -0.35;
+    for (let i = 0; i < continentBlobs.length; i++) {
+      const b = continentBlobs[i];
+      const dLon = wrapLon(lon - b.lon) / b.rx;
+      const dLat = (lat - b.lat) / b.ry;
+      const d2 = dLon * dLon + dLat * dLat;
+      if (d2 < 2.2) {
+        h += b.w * Math.exp(-d2 * 1.45);
+      }
+    }
+    // Deterministic fractal coastline detail
+    const n1 = Math.sin(lon * 5 + Math.cos(lat * 4) * 1.7) * 0.16;
+    const n2 = Math.cos(lon * 11 - lat * 9) * 0.09;
+    const n3 = Math.sin(lon * 23 + lat * 19) * 0.045;
+    return h + n1 + n2 + n3;
+  }
+
+  // --- Pre-generated Point Clouds (Typed Arrays, Zero Per-Frame Garbage) ---
+
+  // 1. Snow (~240 flakes)
+  const SNOW_COUNT = 240;
+  const snowX = new Float32Array(SNOW_COUNT);
+  const snowY = new Float32Array(SNOW_COUNT);
+  const snowSpeed = new Float32Array(SNOW_COUNT);
+  const snowAlpha = new Float32Array(SNOW_COUNT);
+  const snowPhase = new Float32Array(SNOW_COUNT);
+  const snowAmp = new Float32Array(SNOW_COUNT);
+  for (let i = 0; i < SNOW_COUNT; i++) {
+    snowX[i] = rng();
+    snowY[i] = rng();
+    const depth = rng(); // 0 far .. 1 near
+    snowSpeed[i] = lerp(0.015, 0.05, depth);
+    snowAlpha[i] = lerp(0.22, 1.0, depth);
+    snowPhase[i] = rng() * Math.PI * 2;
+    snowAmp[i] = lerp(0.4, 1.6, rng());
+  }
+
+  // 2. Globe Surface Point Cloud (~130,000 points) + City/Beacon Nodes (~4,500 points)
+  const GLOBE_PTS = 130000;
+  const gLon = new Float32Array(GLOBE_PTS);
+  const gLat = new Float32Array(GLOBE_PTS);
+  const gCosLat = new Float32Array(GLOBE_PTS);
+  const gSinLat = new Float32Array(GLOBE_PTS);
+  const gType = new Uint8Array(GLOBE_PTS); // 0=ocean, 1=land, 2=mountain/ice, 3=DIVIZTY emblem
+  const gShadeBase = new Float32Array(GLOBE_PTS);
+  const gHueJitter = new Float32Array(GLOBE_PTS);
+  const gGridMask = new Uint8Array(GLOBE_PTS);
+
+  for (let i = 0; i < GLOBE_PTS; i++) {
+    // Fibonacci-jittered uniform sphere distribution
+    const u = (i + rng()) / GLOBE_PTS;
+    const sinLat = 1 - 2 * u;
+    const lat = Math.asin(clamp(sinLat, -1, 1));
+    const cosLat = Math.cos(lat);
+    const lon = wrapLon(i * 2.39996323 + (rng() - 0.5) * 0.035);
+
+    gLon[i] = lon;
+    gLat[i] = lat;
+    gCosLat[i] = cosLat;
+    gSinLat[i] = sinLat;
+    gHueJitter[i] = (rng() - 0.5) * 12;
+
+    const elev = sampleElevation(lon, lat);
+    const absLat = Math.abs(lat);
+    const isBrand = sampleBrand(lon, lat) === 1;
+
+    // Subtle lat/lon graticule lines
+    const latDeg = Math.abs((lat * 180 / Math.PI) % 30);
+    const lonDeg = Math.abs((lon * 180 / Math.PI) % 30);
+    const onGrid = (latDeg < 1.15 || latDeg > 28.85 || lonDeg < 1.15 || lonDeg > 28.85) ? 1 : 0;
+    gGridMask[i] = onGrid;
+
+    if (isBrand) {
+      gType[i] = 3;
+      gShadeBase[i] = 0.92 + rng() * 0.08;
+    } else if (absLat > 1.24 + Math.sin(lon * 6) * 0.06) {
+      gType[i] = 2; // Polar ice cap
+      gShadeBase[i] = 0.78 + rng() * 0.22;
+    } else if (elev > 0.04) {
+      if (elev > 0.55) {
+        gType[i] = 2; // High mountain ridge
+        gShadeBase[i] = 0.7 + rng() * 0.25;
+      } else {
+        gType[i] = 1; // Emerald / Teal landmass
+        gShadeBase[i] = clamp(0.45 + elev * 0.85 + (rng() - 0.5) * 0.15, 0.25, 0.98);
+      }
+    } else {
+      gType[i] = 0; // Deep ocean
+      const shelf = smoothstep(-0.35, 0.04, elev);
+      gShadeBase[i] = lerp(0.18, 0.52, shelf) + (rng() - 0.5) * 0.08;
+    }
+  }
+
+  // City & Coastal Beacon Lights (~4,200 points clustered on land & brand edges)
+  const LIGHT_PTS = 4200;
+  const lLon = new Float32Array(LIGHT_PTS);
+  const lLat = new Float32Array(LIGHT_PTS);
+  const lCosLat = new Float32Array(LIGHT_PTS);
+  const lSinLat = new Float32Array(LIGHT_PTS);
+  const lHue = new Float32Array(LIGHT_PTS);
+  const lPhase = new Float32Array(LIGHT_PTS);
+  const lGlyph = new Array(LIGHT_PTS);
+
+  const hueRamp = [318, 282, 228, 190, 150, 56, 38, 56, 150, 190, 228, 282, 318];
+  function sampleRainbowHue(t) {
+    t = ((t % 1) + 1) % 1;
+    const scaled = t * (hueRamp.length - 1);
+    const idx = Math.floor(scaled);
+    const frac = scaled - idx;
+    return lerp(hueRamp[idx], hueRamp[Math.min(hueRamp.length - 1, idx + 1)], frac);
+  }
+
+  let lCount = 0;
+  let attempts = 0;
+  const lightGlyphs = ['@', 'o', '*', '0'];
+  while (lCount < LIGHT_PTS && attempts < 80000) {
+    attempts++;
+    const lon = (rng() * 2 - 1) * Math.PI;
+    const lat = (rng() * 2 - 1) * 1.18;
+    const elev = sampleElevation(lon, lat);
+    const isBrand = sampleBrand(lon, lat) === 1;
+    if (isBrand || (elev > 0.02 && rng() < 0.35)) {
+      lLon[lCount] = lon;
+      lLat[lCount] = lat;
+      lCosLat[lCount] = Math.cos(lat);
+      lSinLat[lCount] = Math.sin(lat);
+      // 87% rainbow ramp, 13% champagne gold
+      if (rng() < 0.87) {
+        lHue[lCount] = sampleRainbowHue((lon + Math.PI) / (Math.PI * 2) + lat * 0.15);
+      } else {
+        lHue[lCount] = 44 + (rng() - 0.5) * 6;
+      }
+      lPhase[lCount] = rng() * Math.PI * 2;
+      lGlyph[lCount] = lightGlyphs[Math.floor(rng() * lightGlyphs.length)];
+      lCount++;
+    }
+  }
+
+  // 3. Orbital DIVIZTY Ring & Satellite Beacons (~18,000 points)
+  const RING_PTS = 18000;
+  const rAngle = new Float32Array(RING_PTS);
+  const rRadMul = new Float32Array(RING_PTS);
+  const rHeight = new Float32Array(RING_PTS);
+  const rType = new Uint8Array(RING_PTS); // 0=ring band, 1=DIVIZTY letters in orbit, 2=inner filament
+
+  for (let i = 0; i < RING_PTS; i++) {
+    const a = (i / RING_PTS) * Math.PI * 2 + (rng() - 0.5) * 0.01;
+    rAngle[i] = a;
+    if (i < 11000) {
+      // Main orbital ribbon with DIVIZTY cut-out lettering
+      const band = rng();
+      rRadMul[i] = lerp(1.30, 1.48, band);
+      const v = rng();
+      rHeight[i] = (v - 0.5) * 2.2;
+      // Check if this point falls on "DIVIZTY" repeated 3 times around the ring
+      const rep = (((a + Math.PI) / (Math.PI * 2)) * 3) % 1;
+      const rowIdx = Math.floor(v * 7);
+      const colIdx = Math.floor((rep / 0.76) * brandCols);
+      if (rep < 0.76 && colIdx >= 0 && colIdx < brandCols && rowIdx >= 0 && rowIdx < 7 &&
+          brandBitmap[rowIdx * brandCols + colIdx] === 1) {
+        rType[i] = 1;
+      } else {
+        rType[i] = 0;
+      }
+    } else {
+      // Secondary slanted orbital wire
+      rRadMul[i] = lerp(1.16, 1.56, rng());
+      rHeight[i] = (rng() - 0.5) * 0.5;
+      rType[i] = 2;
+    }
+  }
+
+  // 4. Five Satellite Cubes / Data Pods around the globe (popping up at 9.0 - 10.5s)
+  const POD_COUNT = 5;
+  const POD_PTS = 1800;
+  const podConfigs = [
+    { angle: 0.0, dist: 1.56, yOff: -0.35, sx: 2.6, sy: 2.6, sz: 2.6, boxH: 354, ribH: 45 },
+    { angle: 1.25, dist: 1.62, yOff: 0.25, sx: 2.0, sy: 2.0, sz: 2.0, boxH: 44, ribH: 354 },
+    { angle: 2.51, dist: 1.54, yOff: -0.15, sx: 3.2, sy: 1.7, sz: 2.8, boxH: 152, ribH: 45 },
+    { angle: 3.77, dist: 1.60, yOff: 0.30, sx: 1.9, sy: 3.1, sz: 1.9, boxH: 215, ribH: 45 },
+    { angle: 5.02, dist: 1.55, yOff: -0.25, sx: 2.4, sy: 2.2, sz: 2.4, boxH: 315, ribH: 45 }
+  ];
+  const pods = podConfigs.map(cfg => {
+    const px = new Float32Array(POD_PTS);
+    const py = new Float32Array(POD_PTS);
+    const pz = new Float32Array(POD_PTS);
+    const pnx = new Float32Array(POD_PTS);
+    const pny = new Float32Array(POD_PTS);
+    const pnz = new Float32Array(POD_PTS);
+    const pRib = new Uint8Array(POD_PTS);
+    for (let i = 0; i < POD_PTS; i++) {
+      const face = i % 6;
+      const u = rng() * 2 - 1;
+      const v = rng() * 2 - 1;
+      let x = 0, y = 0, z = 0, nx = 0, ny = 0, nz = 0;
+      if (face === 0) { x = 1; y = u; z = v; nx = 1; }
+      else if (face === 1) { x = -1; y = u; z = v; nx = -1; }
+      else if (face === 2) { x = u; y = 1; z = v; ny = 1; }
+      else if (face === 3) { x = u; y = -1; z = v; ny = -1; }
+      else if (face === 4) { x = u; y = v; z = 1; nz = 1; }
+      else { x = u; y = v; z = -1; nz = -1; }
+      px[i] = x * cfg.sx;
+      py[i] = y * cfg.sy;
+      pz[i] = z * cfg.sz;
+      pnx[i] = nx; pny[i] = ny; pnz[i] = nz;
+      const onRibbon = (Math.abs(u) < 0.22 || Math.abs(v) < 0.22) ? 1 : 0;
+      pRib[i] = onRibbon;
+    }
+    return { cfg, px, py, pz, pnx, pny, pnz, pRib };
+  });
+
+  // 5. Sparks & Ambient Dust
+  const SPARK_COUNT = 80;
+  const sparkAng = new Float32Array(SPARK_COUNT);
+  const sparkSpd = new Float32Array(SPARK_COUNT);
+  const sparkVy = new Float32Array(SPARK_COUNT);
+  for (let i = 0; i < SPARK_COUNT; i++) {
+    sparkAng[i] = rng() * Math.PI * 2;
+    sparkSpd[i] = lerp(18, 68, rng());
+    sparkVy[i] = lerp(14, 38, rng());
+  }
+
+  const RING_SPARK_COUNT = 54;
+  const rSparkAng = new Float32Array(RING_SPARK_COUNT);
+  const rSparkPhase = new Float32Array(RING_SPARK_COUNT);
+  const rSparkHue = new Float32Array(RING_SPARK_COUNT);
+  for (let i = 0; i < RING_SPARK_COUNT; i++) {
+    rSparkAng[i] = rng() * Math.PI * 2;
+    rSparkPhase[i] = rng();
+    rSparkHue[i] = sampleRainbowHue(rng());
+  }
+
+  const DUST_COUNT = 170;
+  const dustAng = new Float32Array(DUST_COUNT);
+  const dustRad = new Float32Array(DUST_COUNT);
+  const dustSpd = new Float32Array(DUST_COUNT);
+  const dustPhase = new Float32Array(DUST_COUNT);
+  const dustHue = new Float32Array(DUST_COUNT);
+  for (let i = 0; i < DUST_COUNT; i++) {
+    dustAng[i] = rng() * Math.PI * 2;
+    dustRad[i] = lerp(1.12, 1.65, rng());
+    dustSpd[i] = lerp(0.12, 0.32, rng());
+    dustPhase[i] = rng();
+    dustHue[i] = sampleRainbowHue(rng());
+  }
+
+  // --- 2D Signed Distance Field: Leaping White Reindeer Orbiting in Front ---
+  function sdEllipse(px, py, ex, ey, rx, ry, ang) {
+    const c = Math.cos(ang), s = Math.sin(ang);
+    const dx = px - ex, dy = py - ey;
+    const lx = (dx * c + dy * s) / rx;
+    const ly = (-dx * s + dy * c) / ry;
+    return (Math.hypot(lx, ly) - 1.0) * Math.min(rx, ry);
+  }
+
+  function sdTaperedCapsule(px, py, ax, ay, bx, by, ra, rb) {
+    const pax = px - ax, pay = py - ay;
+    const bax = bx - ax, bay = by - ay;
+    const h = clamp((pax * bax + pay * bay) / (bax * bax + bay * bay), 0, 1);
+    const d = Math.hypot(pax - bax * h, pay - bay * h);
+    return d - lerp(ra, rb, h);
+  }
+
+  function evalReindeerSDF(px, py, stridePhase) {
+    const s1 = Math.sin(stridePhase * Math.PI * 2);
+    const c1 = Math.cos(stridePhase * Math.PI * 2);
+    const s2 = Math.sin((stridePhase + 0.5) * Math.PI * 2);
+    const c2 = Math.cos((stridePhase + 0.5) * Math.PI * 2);
+
+    const bob = -Math.abs(s1) * 0.65;
+    py -= bob;
+
+    // Torso: chest, belly, rump
+    let d = sdEllipse(px, py, 2.8, -0.3, 3.6, 2.3, -0.18);
+    d = Math.min(d, sdEllipse(px, py, -0.4, 0.1, 3.8, 2.1, 0.05));
+    d = Math.min(d, sdEllipse(px, py, -4.2, -0.2, 3.0, 2.1, 0.15));
+
+    // Two-segment neck
+    const headBob = s1 * 0.25;
+    const nx1 = 5.4, ny1 = -3.4 + headBob;
+    const nx2 = 6.8, ny2 = -5.4 + headBob;
+    d = Math.min(d, sdTaperedCapsule(px, py, 3.8, -1.2, nx1, ny1, 1.85, 1.35));
+    d = Math.min(d, sdTaperedCapsule(px, py, nx1, ny1, nx2, ny2, 1.35, 1.05));
+
+    // Head, muzzle, ear
+    d = Math.min(d, sdEllipse(px, py, nx2 + 0.8, ny2 - 0.1, 1.85, 1.15, 0.12));
+    d = Math.min(d, sdTaperedCapsule(px, py, nx2 + 1.4, ny2 + 0.1, nx2 + 3.4, ny2 + 0.55, 0.9, 0.52));
+    d = Math.min(d, sdTaperedCapsule(px, py, nx2 - 0.3, ny2 - 0.8, nx2 - 1.6, ny2 - 2.1, 0.45, 0.2));
+
+    // Upturned tail
+    d = Math.min(d, sdTaperedCapsule(px, py, -6.8, -0.8, -8.3, -2.3 + s1 * 0.25, 0.75, 0.25));
+
+    // Two antlers with 3 tines each
+    for (let side = 0; side < 2; side++) {
+      const ox = side * -0.45;
+      const oy = side * -0.35;
+      const ax0 = nx2 - 0.1 + ox, ay0 = ny2 - 1.0 + oy;
+      const ax1 = nx2 - 1.5 + ox, ay1 = ny2 - 4.4 + oy;
+      const ax2 = nx2 - 0.5 + ox, ay2 = ny2 - 6.8 + oy;
+      d = Math.min(d, sdTaperedCapsule(px, py, ax0, ay0, ax1, ay1, 0.28, 0.2));
+      d = Math.min(d, sdTaperedCapsule(px, py, ax1, ay1, ax2, ay2, 0.2, 0.14));
+      // 3 tines
+      d = Math.min(d, sdTaperedCapsule(px, py, ax0 - 0.4, ay0 - 1.2, ax0 + 1.1, ay0 - 2.2, 0.18, 0.11));
+      d = Math.min(d, sdTaperedCapsule(px, py, ax1, ay1, ax1 + 1.3, ay1 - 1.4, 0.17, 0.11));
+      d = Math.min(d, sdTaperedCapsule(px, py, ax2, ay2, ax2 - 1.1, ay2 - 1.3, 0.15, 0.1));
+    }
+
+    // Four legs (diagonal pairs half a cycle apart)
+    // Front legs (2 segments)
+    const frontLegs = [
+      { s: s1, c: c1, ox: 3.6, oy: 1.1 },
+      { s: s2, c: c2, ox: 3.1, oy: 1.2 }
+    ];
+    for (let i = 0; i < 2; i++) {
+      const lg = frontLegs[i];
+      const upperAng = 0.35 + lg.s * 0.75;
+      const kneeX = lg.ox + Math.sin(upperAng) * 3.1;
+      const kneeY = lg.oy + Math.cos(upperAng) * 3.1;
+      const lowerAng = upperAng - 0.45 - Math.max(0, -lg.c) * 0.85;
+      const hoofX = kneeX + Math.sin(lowerAng) * 3.2;
+      const hoofY = kneeY + Math.cos(lowerAng) * 3.2;
+      d = Math.min(d, sdTaperedCapsule(px, py, lg.ox, lg.oy, kneeX, kneeY, 0.85, 0.48));
+      d = Math.min(d, sdTaperedCapsule(px, py, kneeX, kneeY, hoofX, hoofY, 0.46, 0.3));
+    }
+
+    // Hind legs with backward-bent hock
+    const hindLegs = [
+      { s: s2, c: c2, ox: -4.6, oy: 1.0 },
+      { s: s1, c: c1, ox: -5.1, oy: 1.1 }
+    ];
+    for (let i = 0; i < 2; i++) {
+      const lg = hindLegs[i];
+      const thighAng = -0.35 + lg.s * 0.72;
+      const hockX = lg.ox + Math.sin(thighAng) * 3.3;
+      const hockY = lg.oy + Math.cos(thighAng) * 3.3;
+      const shinAng = thighAng + 0.55 + Math.max(0, lg.c) * 0.65;
+      const hoofX = hockX + Math.sin(shinAng) * 3.3;
+      const hoofY = hockY + Math.cos(shinAng) * 3.3;
+      d = Math.min(d, sdTaperedCapsule(px, py, lg.ox, lg.oy, hockX, hockY, 0.95, 0.5));
+      d = Math.min(d, sdTaperedCapsule(px, py, hockX, hockY, hoofX, hoofY, 0.48, 0.3));
+    }
+
+    return d;
+  }
+
+  // --- Web Audio API Synthesizer (Zero External Files) ---
+  let audioCtx = null;
+  let masterBus = null;
+  let noiseBuffer = null;
+
+  function initAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC();
+
+      // Generate 2.4s stereo cubic-decay white noise impulse response
+      const sr = audioCtx.sampleRate;
+      const irLen = Math.floor(sr * 2.4);
+      const irBuf = audioCtx.createBuffer(2, irLen, sr);
+      for (let ch = 0; ch < 2; ch++) {
+        const data = irBuf.getChannelData(ch);
+        for (let i = 0; i < irLen; i++) {
+          const env = Math.pow(1 - i / irLen, 3);
+          data[i] = (Math.random() * 2 - 1) * env;
+        }
+      }
+
+      // Reusable 2s white noise loop buffer
+      noiseBuffer = audioCtx.createBuffer(1, sr * 2, sr);
+      const nData = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < nData.length; i++) {
+        nData[i] = Math.random() * 2 - 1;
+      }
+
+      masterBus = audioCtx.createGain();
+      masterBus.gain.value = 1.0;
+
+      const dryGain = audioCtx.createGain();
+      dryGain.gain.value = 0.85;
+
+      const convolver = audioCtx.createConvolver();
+      convolver.buffer = irBuf;
+      const wetGain = audioCtx.createGain();
+      wetGain.gain.value = 0.32;
+
+      const compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -16;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.005;
+      compressor.release.value = 0.15;
+
+      const outGain = audioCtx.createGain();
+      outGain.gain.value = 1.3;
+
+      masterBus.connect(dryGain);
+      masterBus.connect(convolver);
+      convolver.connect(wetGain);
+      dryGain.connect(compressor);
+      wetGain.connect(compressor);
+      compressor.connect(outGain);
+      outGain.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+  }
+
+  // C Major Pentatonic Scale starting at C5 (523.25 Hz)
+  const PENTA_SEMI = [0, 2, 4, 7, 9];
+  function pentaFreq(idx) {
+    const oct = Math.floor(idx / 5);
+    const deg = ((idx % 5) + 5) % 5;
+    const semi = oct * 12 + PENTA_SEMI[deg];
+    return 523.25 * Math.pow(2, semi / 12);
+  }
+
+  function canPlayAudio() {
+    return audioCtx && audioCtx.state === 'running';
+  }
+
+  function playBell(freq, dur = 1.1, gain = 0.14, pan = 0, delay = 0) {
+    if (!canPlayAudio()) return;
+    const t0 = audioCtx.currentTime + delay;
+    const panner = audioCtx.createStereoPanner();
+    panner.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+    panner.connect(masterBus);
+
+    const partials = [
+      { mult: 1.0, amp: 1.0, dec: dur },
+      { mult: 2.76, amp: 0.2, dec: dur * 0.55 },
+      { mult: 5.4, amp: 0.07, dec: dur * 0.32 }
+    ];
+    for (let i = 0; i < partials.length; i++) {
+      const p = partials[i];
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq * p.mult, t0);
+      const pk = Math.max(0.0005, gain * p.amp);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(pk, t0 + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + p.dec);
+      osc.connect(g);
+      g.connect(panner);
+      osc.start(t0);
+      osc.stop(t0 + p.dec + 0.02);
+    }
+  }
+
+  function playGlide(fStart, fEnd, dur, gain = 0.12, type = 'sine', pan = 0, delay = 0) {
+    if (!canPlayAudio()) return;
+    const t0 = audioCtx.currentTime + delay;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    const panner = audioCtx.createStereoPanner();
+    osc.type = type;
+    osc.frequency.setValueAtTime(fStart, t0);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(20, fEnd), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + Math.min(0.015, dur * 0.2));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    panner.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+    osc.connect(g);
+    g.connect(panner);
+    panner.connect(masterBus);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  }
+
+  function playNoise(fStart, fEnd, q, dur, gain = 0.08, pan = 0, delay = 0) {
+    if (!canPlayAudio() || !noiseBuffer) return;
+    const t0 = audioCtx.currentTime + delay;
+    const src = audioCtx.createBufferSource();
+    src.buffer = noiseBuffer;
+    src.loop = true;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.setValueAtTime(q, t0);
+    filter.frequency.setValueAtTime(fStart, t0);
+    if (fEnd !== fStart) {
+      filter.frequency.exponentialRampToValueAtTime(Math.max(40, fEnd), t0 + dur);
+    }
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + Math.min(0.03, dur * 0.25));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    const panner = audioCtx.createStereoPanner();
+    panner.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+    src.connect(filter);
+    filter.connect(g);
+    g.connect(panner);
+    panner.connect(masterBus);
+    src.start(t0);
+    src.stop(t0 + dur + 0.02);
+  }
+
+  function playPad(freq, dur = 3.0, gain = 0.075, pan = 0) {
+    if (!canPlayAudio()) return;
+    const t0 = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    const panner = audioCtx.createStereoPanner();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(gain, t0 + 0.55);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    panner.pan.setValueAtTime(clamp(pan, -1, 1), t0);
+    osc.connect(g);
+    g.connect(panner);
+    panner.connect(masterBus);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
+
+  // Timeline Cue Tracking
+  let firedCues = new Set();
+  let lastGrowthStep = -1;
+  let lastGrainStep = -1;
+  let lastCometBell = -1;
+
+  function resetAudioCues() {
+    firedCues.clear();
+    lastGrowthStep = -1;
+    lastGrainStep = -1;
+    lastCometBell = -1;
+  }
+
+  function triggerCue(id, fn) {
+    if (!firedCues.has(id)) {
+      firedCues.add(id);
+      fn();
+    }
+  }
+
+  function updateAudioCues(prevT, t) {
+    if (!canPlayAudio()) return;
+
+    // 0.05 drop
+    if (prevT < 0.05 && t >= 0.05) {
+      triggerCue('drop', () => {
+        playGlide(2400, 620, 0.34, 0.11, 'sine', 0);
+        playBell(pentaFreq(10), 1.0, 0.09, 0);
+      });
+    }
+
+    // 0.39 landing
+    if (prevT < 0.39 && t >= 0.39) {
+      triggerCue('land', () => {
+        playGlide(120, 44, 0.45, 0.24, 'sine', 0);
+        playNoise(260, 1400, 1.8, 1.2, 0.09, 0);
+        playBell(pentaFreq(-5), 1.9, 0.15, -0.2);
+        playBell(pentaFreq(-3), 1.9, 0.14, 0.2);
+        playBell(pentaFreq(5), 0.9, 0.08, -0.35, 0.13);
+        playBell(pentaFreq(7), 0.9, 0.08, 0.0, 0.26);
+        playBell(pentaFreq(9), 0.9, 0.08, 0.35, 0.39);
+      });
+    }
+
+    // 1.05 pedestal knocks
+    for (let k = 0; k < 6; k++) {
+      const kt = 1.05 + k * 0.072;
+      if (prevT < kt && t >= kt) {
+        triggerCue('ped_' + k, () => {
+          const baseF = 180 + k * 28;
+          playGlide(baseF, baseF * 0.72, 0.055, 0.13, 'triangle', (k - 2.5) * 0.08);
+          playNoise(900 + k * 120, 600, 3.0, 0.035, 0.06, 0);
+        });
+      }
+    }
+
+    // 1.2 ring sweep
+    if (prevT < 1.2 && t >= 1.2) {
+      triggerCue('ring', () => {
+        playNoise(420, 2400, 2.5, 0.6, 0.08, 0);
+        playGlide(330, 990, 0.6, 0.1, 'sine', 0);
+        playBell(pentaFreq(7), 1.2, 0.12, 0, 0.58);
+      });
+    }
+
+    // 1.8 - 5.4 globe growth sparkle + shimmering atmospheric flutter (non-sweeping)
+    if (t >= 1.8 && t <= 5.4) {
+      const g = clamp((t - 1.8) / 4.35, 0, 1);
+      const step = Math.floor(g * 40);
+      if (step > lastGrowthStep) {
+        lastGrowthStep = step;
+        if (Math.random() < 0.75) {
+          const idx = 5 + Math.floor(Math.random() * 10);
+          playBell(pentaFreq(idx), 0.65, 0.038, Math.random() * 1.6 - 0.8);
+        }
+      }
+      const grainStep = Math.floor((t - 1.8) * 11);
+      if (grainStep > lastGrainStep) {
+        lastGrainStep = grainStep;
+        const env = Math.sin(clamp((t - 1.8) / 3.6, 0, 1) * Math.PI);
+        const flutter = 0.5 + 0.5 * Math.sin(t * 17.3 + grainStep * 2.1);
+        const fCenter = (grainStep % 2 === 0) ? (2600 + (grainStep % 5) * 240) : 6200;
+        playNoise(fCenter, fCenter, 4.5, 0.14, 0.016 * env * flutter, Math.sin(grainStep) * 0.5);
+      }
+    }
+
+    // 5.27 apex star
+    if (prevT < 5.27 && t >= 5.27) {
+      triggerCue('star', () => {
+        for (let i = 0; i < 5; i++) {
+          playBell(pentaFreq(6 + i), 0.7, 0.08, (i - 2) * 0.25, i * 0.07);
+        }
+        // Chord at +0.38s
+        playBell(pentaFreq(5), 2.1, 0.13, -0.65, 0.38);
+        playBell(pentaFreq(7), 2.1, 0.13, -0.22, 0.38);
+        playBell(pentaFreq(9), 2.1, 0.13, 0.22, 0.38);
+        playBell(pentaFreq(10), 2.2, 0.14, 0.65, 0.38);
+        playNoise(4800, 6400, 3.0, 0.75, 0.045, 0, 0.38);
+      });
+    }
+
+    // 5.95 comets
+    if (prevT < 5.95 && t >= 5.95) {
+      triggerCue('comets_start', () => {
+        playNoise(2600, 520, 2.2, 0.85, 0.075, 0);
+      });
+    }
+    if (t >= 5.95 && t <= 8.95) {
+      const cStep = Math.floor(((t - 5.95) / 3.0) * 24);
+      if (cStep > lastCometBell && cStep < 24) {
+        lastCometBell = cStep;
+        const noteIdx = 12 - Math.floor(cStep * 0.55);
+        const pan = (cStep % 2 === 0) ? -0.82 : 0.82;
+        playBell(pentaFreq(noteIdx), 0.8, 0.075, pan);
+      }
+    }
+
+    // 8.95 all lit warm pad chord
+    if (prevT < 8.95 && t >= 8.95) {
+      triggerCue('all_lit', () => {
+        playPad(pentaFreq(-5), 3.0, 0.075, -0.5);
+        playPad(pentaFreq(-3), 3.0, 0.07, -0.18);
+        playPad(pentaFreq(-1), 3.0, 0.07, 0.18);
+        playPad(pentaFreq(0), 3.0, 0.075, 0.5);
+        playBell(pentaFreq(5), 2.4, 0.12, 0);
+      });
+    }
+
+    // 9.05 + 0.26*i five satellite pods popping up
+    for (let i = 0; i < 5; i++) {
+      const gt = 9.05 + 0.26 * i;
+      if (prevT < gt && t >= gt) {
+        triggerCue('pod_' + i, () => {
+          const base = 320 + i * 55;
+          playGlide(base, base * 3.2, 0.075, 0.11, 'sine', (i - 2) * 0.35);
+          playNoise(1800, 1200, 3.0, 0.04, 0.05, (i - 2) * 0.35);
+          playBell(pentaFreq(5 + i), 1.1, 0.11, (i - 2) * 0.35, 0.05);
+        });
+      }
+    }
+
+    // 10.55 reindeer entrance + sleigh bells
+    if (prevT < 10.55 && t >= 10.55) {
+      triggerCue('deer', () => {
+        for (let i = 0; i < 7; i++) {
+          playBell(pentaFreq(4 + i), 0.9, 0.08, -0.7 + i * 0.23, i * 0.075);
+        }
+        for (let s = 0; s < 8; s++) {
+          const dt = 0.2 + s * 0.17;
+          const vol = 0.045 * Math.pow(0.86, s);
+          const pan = Math.sin(s * 1.1) * 0.55;
+          playNoise(6000, 6200, 5.0, 0.06, vol, pan, dt);
+          playBell(pentaFreq(12) * 1.00, 0.22, vol * 0.7, pan, dt);
+          playBell(pentaFreq(12) * 1.018, 0.22, vol * 0.65, pan, dt);
+          playBell(pentaFreq(13) * 0.992, 0.22, vol * 0.6, pan, dt);
+          playBell(pentaFreq(14) * 1.011, 0.22, vol * 0.55, pan, dt);
+        }
+      });
+    }
+  }
+
+  // --- Playback State ---
+  let state = 'start'; // 'start' | 'playing' | 'paused'
+  let simTime = 0;
+  let lastWallTime = performance.now();
+
+  function startFilm() {
+    initAudio();
+    resetAudioCues();
+    simTime = 0;
+    state = 'playing';
+  }
+
+  window.addEventListener('pointerdown', () => {
+    if (state === 'start') {
+      startFilm();
+    } else if (simTime >= 12.0) {
+      startFilm();
+    } else if (state === 'paused') {
+      initAudio();
+      state = 'playing';
+    }
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (state === 'start') {
+        startFilm();
+      } else if (state === 'playing') {
+        state = 'paused';
+      } else if (state === 'paused') {
+        initAudio();
+        state = 'playing';
+      }
+    } else if (e.code === 'Enter') {
+      if (state === 'start' || simTime >= 12.0) {
+        startFilm();
+      }
+    } else if (e.code === 'KeyR') {
+      if (state !== 'start') {
+        startFilm();
+      }
+    }
+  });
+
+  // --- Scene Rendering Functions ---
+
+  function drawSnow(wallSec) {
+    for (let i = 0; i < SNOW_COUNT; i++) {
+      const yNorm = (snowY[i] + wallSec * snowSpeed[i]) % 1.0;
+      const sway = Math.sin(wallSec * 1.3 + snowPhase[i]) * snowAmp[i];
+      const x = snowX[i] * cols + sway;
+      const y = yNorm * rows;
+      put(x, y, '+', `rgba(248,250,255,${snowAlpha[i].toFixed(2)})`, -500);
+    }
+  }
+
+  function drawStartScreen(wallSec) {
+    drawSnow(wallSec);
+    // "PLAY" centered in 5x7 block font, scale 2x
+    const word = 'PLAY';
+    const scaleX = 2;
+    const scaleY = 1;
+    const totalW = (word.length * 6 - 1) * scaleX;
+    const totalH = 7 * scaleY;
+    const startX = cx - totalW * 0.5;
+    const startY = rows * 0.48 - totalH * 0.5;
+
+    for (let c = 0; c < word.length; c++) {
+      const glyph = FONT_5X7[word[c]];
+      for (let r = 0; r < 7; r++) {
+        for (let x = 0; x < 5; x++) {
+          if (glyph[r][x] === '1') {
+            for (let sx = 0; sx < scaleX; sx++) {
+              const gx = startX + (c * 6 + x) * scaleX + sx;
+              const gy = startY + r * scaleY;
+              const tw = 0.5 + 0.5 * Math.sin(wallSec * 3.8 + gx * 0.4 + gy * 0.7);
+              const ch = tw > 0.78 ? '@' : (tw > 0.35 ? '#' : '%');
+              const light = Math.round(lerp(68, 96, tw));
+              put(gx, gy, ch, `hsl(45, 70%, ${light}%)`, 10);
+            }
+          }
+        }
+      }
+    }
+    putHalo(cx, rows * 0.48, 22, 0.16, 45, 65, 85);
+  }
+
+  function drawFallingLight(t) {
+    if (t < 0.05 || t > 0.39) return;
+    const u = (t - 0.05) / 0.34;
+    const fall = u * u; // accelerating downward
+    const startY = -2;
+    const yHead = lerp(startY, floorRow, fall);
+    const tailLen = 22;
+    for (let i = 0; i <= tailLen; i++) {
+      const ty = yHead - i;
+      if (ty < -1) continue;
+      const frac = i / tailLen;
+      const ch = i === 0 ? '@' : (i < 6 ? '#' : '|');
+      const light = Math.round(lerp(98, 42, frac));
+      const sat = Math.round(lerp(25, 65, frac));
+      put(cx, ty, ch, `hsl(46, ${sat}%, ${light}%)`, 50);
+    }
+    putHalo(cx, yHead, 7, 0.45, 46, 55, 92);
+  }
+
+  function drawStageDisc(t, rot) {
+    if (t < 0.39) return;
+    const age = t - 0.39;
+    const spread = easeInOutPow(clamp(age / 1.0, 0, 1), 1.4);
+    const rxMax = 0.8 * 124; // runs off both sides of portrait stage
+    const rxCur = rxMax * spread;
+    const ryCur = rxCur * AR * 0.28;
+    const tilt = 0.28 * AR;
+
+    // Comet landing flash at t = 8.95
+    const cometFlash = (t >= 8.95 && t <= 9.55) ? Math.exp(-(t - 8.95) * 6.5) : 0;
+    const pulseR = ((t * 0.55) % 1.0) * rxMax;
+
+    const ixMin = Math.max(0, Math.floor(cx - rxCur - 1));
+    const ixMax = Math.min(cols - 1, Math.ceil(cx + rxCur + 1));
+    const iyMin = Math.max(0, Math.floor(floorRow - ryCur - 1));
+    const iyMax = Math.min(rows - 1, Math.ceil(floorRow + ryCur + 1));
+
+    for (let iy = iyMin; iy <= iyMax; iy++) {
+      const dy = (iy - floorRow) / tilt;
+      for (let ix = ixMin; ix <= ixMax; ix++) {
+        const dx = ix - cx;
+        const r = Math.hypot(dx, dy);
+        if (r > rxCur) continue;
+
+        const normR = r / rxMax;
+        const ang = Math.atan2(dx, dy) - rot;
+
+        // Rotating disc patterns: double rim, 16 arched petals, solid ring, 8-spoke snowflake, inner ring
+        const rim1 = Math.abs(normR - 0.96) < 0.018;
+        const rim2 = Math.abs(normR - 0.90) < 0.015;
+        const petalWave = Math.abs(Math.sin(ang * 8));
+        const petals = (normR > 0.64 && normR < 0.88) && (Math.abs(normR - (0.66 + petalWave * 0.2)) < 0.024);
+        const solidRing = Math.abs(normR - 0.60) < 0.022;
+        const spokeAng = Math.abs(Math.sin(ang * 4));
+        const snowflake = (normR > 0.22 && normR < 0.58) && (spokeAng < 0.08 || (Math.abs(normR - 0.42) < 0.02 && spokeAng < 0.35));
+        const innerRing = Math.abs(normR - 0.20) < 0.02;
+
+        const isPattern = rim1 || rim2 || petals || solidRing || snowflake || innerRing;
+
+        // Leading bright edge during spread
+        const leadingEdge = spread < 0.99 && (rxCur - r) < 2.8;
+
+        // Slow light sweep + outward pulse
+        const sweep = 0.5 + 0.5 * Math.cos(Math.atan2(dx, dy) - t * 0.9);
+        const pulse = Math.exp(-Math.pow((r - pulseR) / 4.5, 2));
+
+        // Deterministic fill hash
+        let h = ((ix * 1973) ^ (iy * 9277)) >>> 0;
+        h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+        const randVal = ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+
+        if (!isPattern && !leadingEdge && randVal > 0.72) continue;
+
+        let ch = '-';
+        let light = 33 + sweep * 7 + pulse * 10 + cometFlash * 26;
+        let sat = 24;
+
+        if (leadingEdge) {
+          ch = '#';
+          light = 86;
+          sat = 34;
+        } else if (isPattern) {
+          ch = rim1 || solidRing ? '#' : (petals ? '=' : '+');
+          light = 60 + sweep * 9 + pulse * 12 + cometFlash * 22;
+          sat = 30;
+        }
+
+        const z = dy * tilt - 120; // floor plane depth
+        put(ix, iy, ch, `hsl(46, ${sat}%, ${clamp(light, 24, 94).toFixed(0)}%)`, z);
+      }
+    }
+
+    // Impact shockwave rings + 80 sparks (0.39 - 1.39s)
+    if (age < 1.0) {
+      for (let w = 0; w < 3; w++) {
+        const wAge = age - w * 0.11;
+        if (wAge <= 0 || wAge > 0.75) continue;
+        const wr = (wAge / 0.75) * rxMax * 0.95;
+        const steps = Math.max(40, Math.floor(wr * 4));
+        const wLight = Math.round(lerp(88, 42, wAge / 0.75));
+        for (let s = 0; s < steps; s++) {
+          const a = (s / steps) * Math.PI * 2;
+          const sx = cx + Math.sin(a) * wr;
+          const sy = floorRow + Math.cos(a) * wr * tilt;
+          put(sx, sy, '#', `hsl(46, 36%, ${wLight}%)`, Math.cos(a) * wr * tilt - 110);
+        }
+      }
+
+      for (let i = 0; i < SPARK_COUNT; i++) {
+        const u = age / 0.95;
+        if (u > 1) continue;
+        const dist = sparkSpd[i] * age;
+        const up = sparkVy[i] * age - 36 * age * age;
+        if (up < -1) continue;
+        const sx = cx + Math.sin(sparkAng[i]) * dist;
+        const sy = floorRow + Math.cos(sparkAng[i]) * dist * tilt - up * AR;
+        const ch = u < 0.35 ? '*' : (u < 0.7 ? '+' : '.');
+        const light = Math.round(lerp(94, 48, u));
+        put(sx, sy, ch, `hsl(46, 48%, ${light}%)`, Math.cos(sparkAng[i]) * dist * tilt + 20);
+      }
+    } else {
+      // Gentle rising gold motes from rim
+      for (let m = 0; m < 16; m++) {
+        const mLife = ((t * 0.35 + m * 0.37) % 1.0);
+        const a = m * 2.399 + t * 0.25;
+        const mr = rxMax * 0.85;
+        const mx = cx + Math.sin(a) * mr;
+        const my = floorRow + Math.cos(a) * mr * tilt - mLife * 14 * AR;
+        const ch = mLife < 0.5 ? '+' : '.';
+        put(mx, my, ch, `hsl(46, 42%, ${Math.round(lerp(72, 42, mLife))}%)`, Math.cos(a) * mr * tilt);
+      }
+    }
+  }
+
+  function drawGlobe(t, rot, deerActive, deerX, deerY) {
+    if (t < 1.8) return;
+    const g = clamp((t - 1.8) / 4.35, 0, 1);
+    const F = easeInOutPow(g, 1.5) * 1.12; // sweeps south pole (0) to north pole (1)
+    const tilt = 0.17 * AR;
+    const R = globeRadiusCols;
+
+    // Directional light from LEFT (-0.82, -0.32, 0.48)
+    const lx = -0.82, ly = -0.32, lz = 0.48;
+    const bodyGlyphs = ['8', '&', '%', '#', '@'];
+
+    // Draw Globe Sphere Points
+    for (let i = 0; i < GLOBE_PTS; i++) {
+      const hNorm = (gSinLat[i] + 1) * 0.5; // 0 south pole .. 1 north pole
+      if (F < hNorm) continue;
+
+      const age = clamp((F - hNorm) / 0.22, 0, 1);
+      const rScale = easeOutBack(age, 1.1);
+      const rCur = R * rScale;
+
+      const phi = gLon[i] + rot;
+      const sinPhi = Math.sin(phi);
+      const cosPhi = Math.cos(phi);
+      const cosLat = gCosLat[i];
+      const sinLat = gSinLat[i];
+
+      // Unit sphere normal
+      const nx = cosLat * sinPhi;
+      const ny = -sinLat;
+      const nz = cosLat * cosPhi;
+
+      // Backface cull with slight rim wrap
+      if (nz < -0.08) continue;
+
+      const sx = cx + rCur * nx;
+      const z = rCur * nz;
+      const sy = globeCenterRow + rCur * ny * AR + z * tilt;
+
+      // Diffuse lighting from left + soft terminator falloff
+      const ndotl = nx * lx + ny * ly + nz * lz;
+      const lit = clamp((ndotl + 0.28) / 1.28, 0, 1);
+      const shade = Math.pow(lit, 0.85) * gShadeBase[i];
+
+      // Dim behind leaping white reindeer so silhouette pops cleanly
+      let deerDim = 1.0;
+      if (deerActive && z > 0) {
+        const dDist = Math.hypot(sx - deerX, (sy - deerY) / AR);
+        if (dDist < 9.5) {
+          deerDim = lerp(0.24, 1.0, smoothstep(4.5, 9.5, dDist));
+        }
+      }
+
+      const type = gType[i];
+      let hue = 205 + gHueJitter[i];
+      let sat = 65;
+      let light = 10;
+      let ch = '8';
+
+      if (age < 0.25) {
+        // Freshly materialized edge
+        ch = '#';
+        hue = 192;
+        sat = 75;
+        light = 52 * deerDim;
+      } else if (type === 3) {
+        // DIVIZTY carved golden-white continents
+        hue = 44 + gHueJitter[i] * 0.3;
+        sat = 68;
+        light = lerp(24, 88, Math.pow(lit, 0.7)) * deerDim;
+        const bIdx = Math.min(4, Math.floor(lerp(1, 4.99, lit)));
+        ch = bodyGlyphs[bIdx];
+      } else if (type === 2) {
+        // Polar snow / high mountain peaks (frost on lit side)
+        hue = 46;
+        sat = lit > 0.45 ? 8 : 24;
+        light = lerp(16, 94, lit) * deerDim;
+        const bIdx = Math.min(4, Math.floor(shade * 4.99));
+        ch = bodyGlyphs[bIdx];
+      } else if (type === 1) {
+        // Emerald-jade continents
+        hue = 152 + gHueJitter[i];
+        sat = lerp(70, 52, lit);
+        light = lerp(6, 68, shade) * deerDim;
+        const bIdx = Math.min(4, Math.floor(shade * 4.99));
+        ch = bodyGlyphs[bIdx];
+      } else {
+        // Deep sapphire ocean + subtle graticule grid
+        hue = 212 + gHueJitter[i] * 0.6;
+        sat = 64;
+        light = lerp(5, 44, shade);
+        if (gGridMask[i] === 1 && lit > 0.2) {
+          light += 14 * lit;
+          hue = 195;
+        }
+        light *= deerDim;
+        const bIdx = Math.min(3, Math.floor(shade * 3.4));
+        ch = bodyGlyphs[bIdx];
+      }
+
+      put(sx, sy, ch, `hsl(${hue.toFixed(0)}, ${sat.toFixed(0)}%, ${clamp(light, 3, 96).toFixed(0)}%)`, z);
+    }
+
+    // Draw Tilted Orbital DIVIZTY Ring once globe passes equator
+    if (F > 0.45) {
+      const ringReveal = smoothstep(0.45, 0.95, F);
+      const ringTilt = 0.34; // orbital plane inclination
+      const cosT = Math.cos(ringTilt);
+      const sinT = Math.sin(ringTilt);
+
+      for (let i = 0; i < RING_PTS; i++) {
+        if ((i / RING_PTS) > ringReveal) continue;
+        const a = rAngle[i] - rot * 1.35; // counter-rotates smoothly
+        const rad = R * rRadMul[i];
+        const rx0 = rad * Math.sin(a);
+        const rz0 = rad * Math.cos(a);
+        const ry0 = rHeight[i];
+
+        // Tilt orbital plane
+        const rx = rx0 * cosT - ry0 * sinT;
+        const ry = rx0 * sinT + ry0 * cosT;
+        const rz = rz0;
+
+        // Occlude behind globe sphere
+        const dist2D = Math.hypot(rx, ry);
+        if (rz < 0 && dist2D < R * 0.98) continue;
+
+        const sx = cx + rx;
+        const sy = globeCenterRow + ry * AR + rz * tilt;
+
+        if (rType[i] === 1) {
+          // Glowing DIVIZTY lettering orbiting the globe
+          const frontGlow = clamp((rz / rad + 1) * 0.5, 0.25, 1.0);
+          put(sx, sy, '@', `hsl(44, 72%, ${Math.round(lerp(42, 86, frontGlow))}%)`, rz + 2);
+        } else if (rType[i] === 0) {
+          put(sx, sy, '-', `hsl(202, 42%, 34%)`, rz);
+        } else {
+          put(sx, sy, '.', `hsl(195, 55%, 52%)`, rz);
+        }
+      }
+    }
+
+    // Draw City & Beacon Lights (switched on ONLY as the two spiralling comets pass!)
+    if (t >= 5.95) {
+      const cProg = clamp((t - 5.95) / 3.0, 0, 1);
+      const cometLat = lerp(1.25, -1.25, cProg);
+      const cometAngle = cProg * 4 * Math.PI * 2;
+
+      for (let i = 0; i < lCount; i++) {
+        // Height check: comet sweeps top (north) to bottom (south)
+        if (lLat[i] < cometLat) continue;
+        // If near the comet front, require angular sweep pass
+        if (lLat[i] - cometLat < 0.22) {
+          const dAng = ((cometAngle - (lLon[i] + Math.PI)) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+          if (dAng > Math.PI * 1.4) continue;
+        }
+
+        const phi = lLon[i] + rot;
+        const nz = lCosLat[i] * Math.cos(phi);
+        if (nz < 0.02) continue;
+        const nx = lCosLat[i] * Math.sin(phi);
+        const ny = -lSinLat[i];
+
+        const sx = cx + R * nx;
+        const z = R * nz;
+        const sy = globeCenterRow + R * ny * AR + z * tilt;
+
+        // Turn off lights behind the white reindeer
+        if (deerActive && z > 0) {
+          const dDist = Math.hypot(sx - deerX, (sy - deerY) / AR);
+          if (dDist < 6.5) continue;
+        }
+
+        const justHit = clamp(1 - (lLat[i] - cometLat) / 0.14, 0, 1);
+        const twinkle = 0.5 + 0.5 * Math.sin(t * 5.2 + lPhase[i]);
+        const light = clamp(55 + twinkle * 10 + justHit * 32, 52, 95);
+        const ch = justHit > 0.5 ? '@' : lGlyph[i];
+        put(sx, sy, ch, `hsl(${lHue[i].toFixed(0)}, 100%, ${light.toFixed(0)}%)`, z + 1.5);
+      }
+    }
+  }
+
+  function drawGrowthRing(t, rot) {
+    if (t < 1.2 || t > 6.17) return;
+    const tilt = 0.17 * AR;
+    const R = globeRadiusCols;
+
+    // 1.2 - 1.8s: white dot sweeps one full circle at the bottom pole
+    if (t < 1.8) {
+      const sweepFrac = (t - 1.2) / 0.6;
+      const startAng = Math.PI; // behind pedestal
+      const maxSweep = sweepFrac * Math.PI * 2;
+      const ringR = R * 0.45 + 3;
+      const yBase = globeCenterRow + R * AR;
+
+      const steps = 90;
+      for (let s = 0; s <= steps; s++) {
+        const u = s / steps;
+        if (u > sweepFrac) break;
+        const a = startAng + u * Math.PI * 2;
+        const sx = cx + Math.sin(a) * ringR;
+        const z = Math.cos(a) * ringR;
+        const sy = yBase + z * tilt;
+        const isHead = (sweepFrac - u) < 0.03;
+        put(sx, sy, isHead ? '@' : '#', isHead ? 'hsl(46, 20%, 96%)' : 'hsl(200, 75%, 78%)', z + 4);
+        if (isHead) putHalo(sx, sy, 6, 0.45, 46, 30, 92);
+      }
+      return;
+    }
+
+    // 1.8 - 6.17s: ring climbs over the sphere and closes at the north apex
+    const g = clamp((t - 1.8) / 4.35, 0, 1);
+    const F = easeInOutPow(g, 1.5) * 1.12;
+    const hClamped = clamp(F, 0, 1);
+    const sinLat = -1 + 2 * hClamped;
+    const cosLat = Math.sqrt(Math.max(0, 1 - sinLat * sinLat));
+
+    // Close to a point once F >= 0.96
+    const closeScale = F > 0.96 ? clamp(1 - (F - 0.96) / 0.16, 0, 1) : 1.0;
+    const pulse = 1 + 0.03 * Math.sin(t * 9.0);
+    const ringR = (R * cosLat * 1.14 + 2.2) * closeScale * pulse;
+    const yRing = globeCenterRow - R * sinLat * AR;
+
+    // 4 concentric rings of #
+    for (let ringIdx = 0; ringIdx < 4; ringIdx++) {
+      const rCur = ringR + ringIdx * 1.35;
+      const steps = Math.max(36, Math.floor(rCur * 4.5));
+      const stackH = ringIdx === 0 ? 3 : 1;
+      for (let s = 0; s < steps; s++) {
+        const a = (s / steps) * Math.PI * 2 - rot * 1.4;
+        const sx = cx + Math.sin(a) * rCur;
+        const z = Math.cos(a) * rCur;
+        for (let st = 0; st < stackH; st++) {
+          const sy = yRing + z * tilt - st;
+          if (ringIdx === 0) {
+            const l = 94 - st * 14;
+            put(sx, sy, '#', `hsl(46, 18%, ${l}%)`, z + 5);
+          } else {
+            const hue = (a * 180 / Math.PI + t * 140 + ringIdx * 45) % 360;
+            const l = 74 - ringIdx * 11;
+            put(sx, sy, '#', `hsl(${hue.toFixed(0)}, 82%, ${l}%)`, z + 5 - ringIdx * 0.2);
+          }
+        }
+      }
+    }
+
+    // 54 pastel sparks flying outward and falling
+    for (let i = 0; i < RING_SPARK_COUNT; i++) {
+      const life = (t * 1.35 + rSparkPhase[i]) % 1.0;
+      const a = rSparkAng[i] + t * 0.7;
+      const sr = ringR + life * 9.5;
+      const drop = life * life * 6.5 * AR;
+      const sx = cx + Math.sin(a) * sr;
+      const z = Math.cos(a) * sr;
+      const sy = yRing + z * tilt + drop;
+      const ch = life < 0.35 ? '*' : (life < 0.7 ? '+' : '.');
+      const l = Math.round(lerp(88, 52, life));
+      put(sx, sy, ch, `hsl(${rSparkHue[i].toFixed(0)}, 78%, ${l}%)`, z + 6);
+    }
+  }
+
+  function drawApexStar(t) {
+    if (t < 5.27) return;
+    const age = t - 5.27;
+    const open = clamp(age / 0.9, 0, 1);
+    const sx = cx;
+    const sy = apexRow;
+
+    if (open < 0.32) {
+      // Initial dot #@#
+      put(sx - 1, sy, '#', 'hsl(44, 66%, 72%)', 40);
+      put(sx, sy, '@', 'hsl(44, 66%, 80%)', 41);
+      put(sx + 1, sy, '#', 'hsl(44, 66%, 72%)', 40);
+      putHalo(sx, sy, 8, 0.45, 44, 66, 78);
+      return;
+    }
+
+    const rayEase = easeOutBack(clamp((open - 0.32) / 0.68, 0, 1), 1.3);
+    const breathe = 1 + 0.06 * Math.sin(t * 2.4);
+    // Soft glint every 3.6s
+    const glintCycle = ((t - 5.65) % 3.6 + 3.6) % 3.6;
+    const glint = glintCycle < 0.45 ? Math.sin((glintCycle / 0.45) * Math.PI) : 0;
+
+    // 3-row core
+    const topBot = [' ', ' ', '#', '#', '#', ' ', ' '];
+    const midRow = ['#', '#', '@', '@', '@', '#', '#'];
+    for (let dx = -3; dx <= 3; dx++) {
+      const idx = dx + 3;
+      if (topBot[idx] !== ' ') {
+        put(sx + dx, sy - 1, topBot[idx], `hsl(44, 66%, ${Math.round(74 + glint * 14)}%)`, 45);
+        put(sx + dx, sy + 1, topBot[idx], `hsl(44, 66%, ${Math.round(74 + glint * 14)}%)`, 45);
+      }
+      const l = midRow[idx] === '@' ? (80 + glint * 15) : (72 + glint * 12);
+      put(sx + dx, sy, midRow[idx], `hsl(44, 66%, ${Math.round(l)}%)`, 46);
+    }
+
+    // 4 long cardinal rays (about 13 cells) + 4 diagonal rays (half length)
+    const longLen = Math.round(13 * rayEase * breathe);
+    const diagLen = Math.round(6.5 * rayEase * breathe);
+
+    for (let d = 2; d <= longLen; d++) {
+      const frac = d / Math.max(1, longLen);
+      const l = Math.round(lerp(78, 56, frac) + glint * 14);
+      const col = `hsl(44, 66%, ${clamp(l, 50, 94)}%)`;
+      const chH = frac > 0.88 ? '.' : (frac > 0.72 ? ':' : '-');
+      const chV = frac > 0.88 ? '.' : (frac > 0.72 ? ':' : '|');
+      put(sx + d, sy, chH, col, 44);
+      put(sx - d, sy, chH, col, 44);
+      put(sx, sy + d * AR, chV, col, 44);
+      put(sx, sy - d * AR, chV, col, 44);
+    }
+
+    for (let d = 2; d <= diagLen; d++) {
+      const frac = d / Math.max(1, diagLen);
+      const l = Math.round(lerp(76, 54, frac) + glint * 12);
+      const col = `hsl(44, 66%, ${clamp(l, 50, 92)}%)`;
+      const ch1 = frac > 0.82 ? '.' : '\\';
+      const ch2 = frac > 0.82 ? '.' : '/';
+      put(sx + d, sy + d * AR, ch1, col, 44);
+      put(sx - d, sy - d * AR, ch1, col, 44);
+      put(sx + d, sy - d * AR, ch2, col, 44);
+      put(sx - d, sy + d * AR, ch2, col, 44);
+    }
+
+    // 8 slowly turning short dotted rays between the main rays
+    for (let r = 0; r < 8; r++) {
+      const a = (r + 0.5) * (Math.PI / 4) + t * 0.35;
+      for (let step = 3; step <= 6; step++) {
+        const px = sx + Math.cos(a) * step * rayEase;
+        const py = sy + Math.sin(a) * step * AR * rayEase;
+        put(px, py, step < 5 ? ':' : '.', 'hsl(44, 62%, 70%)', 43);
+      }
+    }
+
+    // 16 pastel orbiting +/* points at radius 11
+    for (let p = 0; p < 16; p++) {
+      const a = (p / 16) * Math.PI * 2 + t * 0.65;
+      const ox = sx + Math.cos(a) * 11 * rayEase;
+      const oy = sy + Math.sin(a) * 11 * AR * rayEase;
+      const hue = sampleRainbowHue(p / 16 + t * 0.08);
+      put(ox, oy, p % 2 === 0 ? '+' : '*', `hsl(${hue.toFixed(0)}, 75%, 76%)`, 43);
+    }
+
+    putHalo(sx, sy, 15 * rayEase, 0.34 + glint * 0.25, 44, 66, 78);
+  }
+
+  function drawComets(t) {
+    if (t < 5.95 || t > 9.45) return;
+    const tilt = 0.17 * AR;
+    const R = globeRadiusCols;
+    const tailSamples = 110;
+
+    for (let c = 0; c < 2; c++) {
+      const sideOffset = c * Math.PI;
+      // Head position along 3.0s descent (5.95 -> 8.95)
+      const headU = (t - 5.95) / 3.0;
+
+      for (let s = 0; s < tailSamples; s++) {
+        const frac = s / tailSamples; // 0 = head, 1 = tail end
+        const u = headU - frac * 0.34;
+        if (u < 0 || u > 1.08) continue;
+
+        // Wind 4 full turns from north pole down to floor
+        const clampedU = Math.min(1, u);
+        const lat = lerp(1.32, -1.35, clampedU);
+        const cosLat = Math.cos(lat);
+        const sinLat = Math.sin(lat);
+        const rad = R * (0.25 + 0.88 * cosLat);
+        const ang = sideOffset + u * 4 * Math.PI * 2;
+
+        // Tail loosens and drifts downward after first 40%
+        const loose = frac > 0.4 ? Math.pow((frac - 0.4) / 0.6, 1.4) : 0;
+        const driftY = loose * 5.5 * AR + (u > 1 ? (u - 1) * 40 * AR : 0);
+        const jitterX = loose * Math.sin(s * 7.3 + t * 6) * 1.8;
+
+        const px = cx + Math.sin(ang) * rad + jitterX;
+        const z = Math.cos(ang) * rad;
+        const py = globeCenterRow - R * sinLat * AR + z * tilt + driftY;
+
+        // Fade out near floor
+        if (py > floorRow + 1) continue;
+
+        const hue = (frac * 320 + t * 180 + c * 180) % 360;
+        const light = Math.round(lerp(88, 44, frac));
+
+        if (s === 0 && u <= 1.0) {
+          // Comet head cluster + 4 twinkling rays
+          put(px, py, '@', 'hsl(45, 20%, 98%)', z + 15);
+          put(px - 1, py, '@', `hsl(${hue.toFixed(0)}, 95%, 70%)`, z + 14);
+          put(px + 1, py, '@', `hsl(${hue.toFixed(0)}, 95%, 70%)`, z + 14);
+          put(px, py - 1, '@', `hsl(${hue.toFixed(0)}, 95%, 70%)`, z + 14);
+          put(px, py + 1, '@', `hsl(${hue.toFixed(0)}, 95%, 70%)`, z + 14);
+          const rayTw = Math.sin(t * 24 + c) > 0 ? 3 : 2;
+          for (let r = 2; r <= rayTw; r++) {
+            put(px - r, py, '-', `hsl(${hue.toFixed(0)}, 90%, 78%)`, z + 13);
+            put(px + r, py, '-', `hsl(${hue.toFixed(0)}, 90%, 78%)`, z + 13);
+            put(px, py - r, '|', `hsl(${hue.toFixed(0)}, 90%, 78%)`, z + 13);
+            put(px, py + r, '|', `hsl(${hue.toFixed(0)}, 90%, 78%)`, z + 13);
+          }
+          putHalo(px, py, 8, 0.5, hue, 85, 80);
+        } else {
+          const ch = frac < 0.22 ? '#' : (frac < 0.48 ? '*' : (frac < 0.76 ? '+' : '.'));
+          put(px, py, ch, `hsl(${hue.toFixed(0)}, 92%, ${light}%)`, z + 12 - frac * 2);
+          if (frac < 0.38) {
+            put(px + 1, py, ch, `hsl(${hue.toFixed(0)}, 88%, ${light - 6}%)`, z + 11.8);
+          }
+        }
+      }
+    }
+  }
+
+  function drawSatellitePods(t, rot) {
+    if (t < 9.0) return;
+    const tilt = 0.17 * AR;
+    const orbitR = globeRadiusCols * 1.48;
+    const glyphs = ['#', '@', '%', '&', '8'];
+
+    for (let p = 0; p < POD_COUNT; p++) {
+      const startT = 9.0 + p * 0.26;
+      if (t < startT) continue;
+      const pop = easeOutBack(clamp((t - startT) / 0.42, 0, 1), 1.8);
+      const pod = pods[p];
+      const cfg = pod.cfg;
+
+      const orbitAng = cfg.angle + rot * 1.15;
+      const bx = cx + Math.sin(orbitAng) * orbitR;
+      const bz = Math.cos(orbitAng) * orbitR;
+      const by = globeCenterRow + cfg.yOff * globeRadiusCols * AR + bz * tilt + Math.sin(t * 2.2 + p) * 0.8 * AR;
+
+      const selfRot = rot * 1.6 + p;
+      const cosR = Math.cos(selfRot);
+      const sinR = Math.sin(selfRot);
+
+      for (let i = 0; i < POD_PTS; i++) {
+        const lx = pod.px[i] * pop;
+        const ly = pod.py[i] * pop;
+        const lz = pod.pz[i] * pop;
+
+        const rx = lx * cosR + lz * sinR;
+        const rz = -lx * sinR + lz * cosR;
+        const nx = pod.pnx[i] * cosR + pod.pnz[i] * sinR;
+        const ny = pod.pny[i];
+        const nz = -pod.pnx[i] * sinR + pod.pnz[i] * cosR;
+
+        if (nz < -0.05) continue;
+
+        const sx = bx + rx;
+        const sy = by + ly * AR + rz * tilt;
+        const z = bz + rz;
+
+        // Top face brightest, left face bright, right face dark
+        const lit = clamp((-nx * 0.75 - ny * 0.55 + nz * 0.45 + 0.35) / 1.35, 0, 1);
+        if (pod.pRib[i] === 1) {
+          const ch = ny < -0.5 ? '#' : '|';
+          const l = Math.round(lerp(36, 82, lit));
+          put(sx, sy, ch, `hsl(${cfg.ribH}, 80%, ${l}%)`, z + 0.2);
+        } else {
+          const gIdx = Math.min(4, Math.floor((1 - lit) * 4.99));
+          const l = Math.round(lerp(12, 68, lit));
+          put(sx, sy, glyphs[gIdx], `hsl(${cfg.boxH}, 78%, ${l}%)`, z);
+        }
+      }
+    }
+  }
+
+  function drawReindeer(t) {
+    if (t < 10.55) return;
+    const enter = easeOutBack(clamp((t - 10.55) / 1.4, 0, 1), 1.45);
+    const stridePhase = (t * 1.15) % 1.0;
+
+    // Leaping in front of the lower-middle globe (at ~20% above equator-base)
+    const rxCenter = cx;
+    const ryCenter = globeCenterRow + globeRadiusCols * 0.22 * AR;
+    const zFront = globeRadiusCols + 14;
+
+    const scaleX = 1.65 * enter;
+    const scaleY = 1.65 * AR * enter;
+    const halfCols = Math.ceil(13 * scaleX);
+    const halfRows = Math.ceil(11 * scaleY);
+
+    for (let dy = -halfRows; dy <= halfRows; dy++) {
+      for (let dx = -halfCols; dx <= halfCols; dx++) {
+        const px = dx / scaleX;
+        const py = dy / scaleY;
+        const d = evalReindeerSDF(px, py, stridePhase);
+        if (d > 0) continue;
+
+        const sx = rxCenter + dx;
+        const sy = ryCenter + dy;
+
+        if (d > -0.75) {
+          // Crisp white edge
+          const ch = d > -0.28 ? '8' : (d > -0.52 ? '#' : '@');
+          put(sx, sy, ch, 'hsl(210, 25%, 96%)', zFront);
+        } else {
+          // Sparse twinkling pale blue-white interior so globe shows through
+          let h = ((Math.round(sx) * 73856093) ^ (Math.round(sy) * 19349663) ^ (haloSeed * 83492791)) >>> 0;
+          const r = (h % 1000) / 1000;
+          if (r < 0.34) {
+            const intGlyphs = ['+', '*', 'x', ':'];
+            const ch = intGlyphs[h % 4];
+            put(sx, sy, ch, 'hsl(206, 55%, 86%)', zFront - 0.5);
+          }
+        }
+      }
+    }
+    return { x: rxCenter, y: ryCenter };
+  }
+
+  function drawAmbientDust(t) {
+    // Starts once globe is 30% grown
+    const g = clamp((t - 1.8) / 4.35, 0, 1);
+    if (g < 0.3) return;
+    const alphaScale = smoothstep(0.3, 0.55, g);
+    const tilt = 0.17 * AR;
+    const R = globeRadiusCols;
+
+    for (let i = 0; i < DUST_COUNT; i++) {
+      const life = (t * dustSpd[i] + dustPhase[i]) % 1.0;
+      const ang = dustAng[i] + t * 0.35 + life * 2.5;
+      const rad = R * dustRad[i];
+      const sx = cx + Math.sin(ang) * rad;
+      const z = Math.cos(ang) * rad;
+      const ySpan = R * 2.2 * AR;
+      const sy = (globeCenterRow + ySpan * 0.5) - life * ySpan + z * tilt;
+      const ch = life < 0.33 ? '.' : (life < 0.72 ? '+' : '*');
+      const l = Math.round(lerp(56, 84, Math.sin(life * Math.PI)) * alphaScale);
+      put(sx, sy, ch, `hsl(${dustHue[i].toFixed(0)}, 72%, ${l}%)`, z);
+    }
+  }
+
+  // --- Main Render Loop ---
+  function render(now) {
+    const dt = Math.min(0.05, (now - lastWallTime) / 1000);
+    lastWallTime = now;
+    const wallSec = now / 1000;
+    haloSeed = Math.floor(wallSec * 9); // Shimmer ~9 times per second
+
+    if (state === 'playing') {
+      const prevT = simTime;
+      simTime += dt;
+      updateAudioCues(prevT, simTime);
+    }
+
+    const t = simTime;
+    const rot = t * 0.5;
+
+    clearGrid();
+
+    if (state === 'start') {
+      drawStartScreen(wallSec);
+    } else {
+      drawSnow(wallSec);
+      drawFallingLight(t);
+      drawStageDisc(t, rot);
+      const deerPos = drawReindeer(t);
+      drawGlobe(t, rot, !!deerPos, deerPos ? deerPos.x : 0, deerPos ? deerPos.y : 0);
+      drawGrowthRing(t, rot);
+      drawApexStar(t);
+      drawComets(t);
+      drawSatellitePods(t, rot);
+      drawAmbientDust(t);
+    }
+
+    // 1. Paint vertical dusk gradient background on main canvas
+    ctx.save();
+    ctx.scale(DPR, DPR);
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0.0, '#323a47');
+    bgGrad.addColorStop(0.55, '#394250');
+    bgGrad.addColorStop(0.86, '#4b5463');
+    bgGrad.addColorStop(1.0, '#666e7d');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+
+    // 2. Render ASCII character grid onto offscreen layer (1 fillText per non-empty cell)
+    offCtx.save();
+    offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
+    offCtx.scale(DPR, DPR);
+    offCtx.font = fontStr;
+    offCtx.textAlign = 'center';
+    offCtx.textBaseline = 'middle';
+
+    let lastCol = '';
+    for (let r = 0; r < rows; r++) {
+      const py = (r + 0.5) * CH;
+      const rowOffset = r * cols;
+      for (let c = 0; c < cols; c++) {
+        const ch = gridChar[rowOffset + c];
+        if (ch === '') continue;
+        const col = gridCol[rowOffset + c];
+        if (col !== lastCol) {
+          offCtx.fillStyle = col;
+          lastCol = col;
+        }
+        offCtx.fillText(ch, (c + 0.5) * CW, py);
+      }
+    }
+    offCtx.restore();
+
+    // 3. Composite crisp character layer + two screen-blended character bloom passes
+    ctx.save();
+    ctx.drawImage(offCanvas, 0, 0);
+
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = 0.4;
+    ctx.filter = `blur(${Math.max(1, PW * 0.006 * DPR).toFixed(1)}px)`;
+    ctx.drawImage(offCanvas, 0, 0);
+
+    ctx.globalAlpha = 0.12;
+    ctx.filter = `blur(${Math.max(2, PW * 0.02 * DPR).toFixed(1)}px)`;
+    ctx.drawImage(offCanvas, 0, 0);
+    ctx.restore();
+
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
